@@ -4,15 +4,20 @@ from transformers import AutoModel, pipeline
 from datasets import Dataset, load_dataset
 import torch
 
-def main(model_id: str, data_dir: str, target_language: str) -> None:
+def main(model_name: str, data_dir: str, target_language: str) -> None:
 
-    pipeline = pipeline(
-            "text-generation", model=model_id, device_map="auto")
+    hf_token = os.getenv("HF_TOKEN")
+
+    
+    model = pipeline(
+            "text-generation", model=model_name, device_map="auto", token=hf_token)
 
     dataset = load_dataset("csv", data_dir=data_dir)
 
+    breakpoint()
+
     dataset = dataset.map(lambda batch: translate_sentences(
-        batch, model=pipeline, target_language=target_language, batched=True))
+        batch, model=model, target_language=target_language, batched=True))
 
     save_dataset(dataset, data_dir)
 
@@ -43,7 +48,7 @@ if __name__ == "__main__":
                       help= "The language to which thew data should be translated",
                       type=str)
 
-  args = vars(parser.parse_args)
+  args = vars(parser.parse_args())
   # dict of argument
 
   main(**args)
