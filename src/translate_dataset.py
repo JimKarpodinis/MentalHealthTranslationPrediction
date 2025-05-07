@@ -1,7 +1,7 @@
 import argparse
 import os
 from transformers import AutoModel, pipeline
-from accelerate import Accelerator
+from accelerate import PartialState
 from accelerate.utils import gather_object
 from datasets import Dataset, load_dataset
 import torch
@@ -9,25 +9,21 @@ import torch
 
 def main(model_name: str, data_dir: str, target_language: str) -> None:
 
-    accelerator = Accelerator()
-
     hf_token = os.getenv("HF_TOKEN")
 
     model = pipeline(
             "text-generation", model=model_name, device_map="auto",
             token=hf_token, return_full_text=False)
 
-    dataset = load_dataset("csv", data_dir=data_dir)
+    dataset = load_dataset("csv", data_dir=data_dir, split="train")
 
     dataset = dataset.map(lambda example: create_instruction_prompt(
         example, target_language))
 
-    dataset = dataset.map(lambda examples: translate_sentences(
-        examples, model=model,
-        target_language=target_language, accelerator=accelerator),
-        batched=True, remove_columns=["text"])
+    dataset = dataset.map(lambda batch: translate_sentences(
+        batch, model), batched=True, batch_size=64)
 
-    save_dataset(dataset, data_dir)
+    save_dataset(dataset, data_dir, model_name)
 
 
 def create_instruction_prompt(example: dict, target_language: str) -> dict:
@@ -44,21 +40,50 @@ def create_instruction_prompt(example: dict, target_language: str) -> dict:
     return example
 
 
-def translate_sentences(examples: list, model: AutoModel,
-        target_language: str, accelerator: Accelerator) -> str:
+def translate_sentences(examples: dict, model: AutoModel) -> dict:
 
-    split_prompts = accelerator.split_between_processes(
-    examples["instruction_prompt"], apply_padding=True)
+    sentence_lengths = model.tokenizer(
+            examples["text"], padding=False,
+            truncation=False, return_length=True)["length"]
 
-    with split_prompts as batched_prompts:
-        for prompt in batched_prompts:
-            model_output = model(prompt,
-                max_new_tokens=10000)
+    max_batch_sentence_length = max(sentence_lengths)
 
-    all_model_outputs = gather_object(model_outputs)
-    all_translated_texts = [output["generated_text"] for output in all_model_outputs]
+    model_outputs = model(
+            examples["instruction_prompt"],
+            max_new_tokens=max_batch_sentence_length)
 
-    examples["translated_texts"] = all_translated_texts
+    translations = [output[0]["generated_text"] for output in model_outputs]
+
+    examples["translated_text"] = translations
+
+    return examples
+
+
+def translate_sentences_accelerate(examples: dict, model: AutoModel) -> dict:
+
+    partial_state = PartialState()
+
+    sentence_lengths = model.tokenizer(
+            examples["text"], padding=False,
+            truncation=False, return_length=True)["length"]
+
+    max_batch_sentence_length = max(sentence_lengths)
+
+    with partial_state.split_between_processes(
+            examples["instruction_prompt"]) as batched_prompts:
+
+        model_outputs_ = model(
+                batched_prompts,
+                max_new_tokens=max_batch_sentence_length)
+
+    partial_state.wait_for_everyone()
+    model_outputs = gather_object(model_outputs_)
+
+    if partial_state.is_main_process:
+
+        translations = [output[0]["generated_text"] for output in model_outputs]
+
+        examples["translated_text"] = translations
 
     return examples
 
