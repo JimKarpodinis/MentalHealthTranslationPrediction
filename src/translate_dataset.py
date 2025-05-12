@@ -1,6 +1,6 @@
 import argparse
 import os
-from transformers import AutoModel, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate import PartialState
 from accelerate.utils import gather_object
 from datasets import Dataset, load_dataset
@@ -11,9 +11,9 @@ def main(model_name: str, data_dir: str, target_language: str) -> None:
 
     hf_token = os.getenv("HF_TOKEN")
 
-    model = pipeline(
-            "text-generation", model=model_name, device_map="auto",
-            token=hf_token, return_full_text=False)
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
 
     dataset = load_dataset("csv", data_dir=data_dir, split="train")
 
@@ -21,7 +21,7 @@ def main(model_name: str, data_dir: str, target_language: str) -> None:
         example, target_language))
 
     dataset = dataset.map(lambda batch: translate_sentences(
-        batch, model), batched=True, batch_size=64)
+        batch, model, tokenizer), batched=True, batch_size=64)
 
     save_dataset(dataset, data_dir, model_name)
 
@@ -40,16 +40,27 @@ def create_instruction_prompt(example: dict, target_language: str) -> dict:
     return example
 
 
-def translate_sentences(examples: dict, model: AutoModel) -> dict:
+def translate_sentences(examples: dict,
+        model: AutoModelForCausalLM, tokenizer: AutoTokenizer) -> dict:
 
-    sentence_lengths = model.tokenizer(
+    sentence_lengths = tokenizer(
             examples["text"], padding=False,
             truncation=False, return_length=True)["length"]
 
     max_batch_sentence_length = max(sentence_lengths)
 
-    model_outputs = model(
+    if tokenizer.chat_template is None:
+
+        tokenizer.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+
+    tokenized_examples = tokenizer.apply_chat_template(
             examples["instruction_prompt"],
+            tokenize=True,
+            add_generation_prompt=True, return_tensors="pt",
+            max_length=512, truncation=True, padding=True).to("cuda")
+
+    model_outputs = model.generate(
+            tokenized_examples,
             max_new_tokens=max_batch_sentence_length)
 
     translations = [output[0]["generated_text"] for output in model_outputs]
@@ -59,11 +70,11 @@ def translate_sentences(examples: dict, model: AutoModel) -> dict:
     return examples
 
 
-def translate_sentences_accelerate(examples: dict, model: AutoModel) -> dict:
+def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM) -> dict:
 
     partial_state = PartialState()
 
-    sentence_lengths = model.tokenizer(
+    sentence_lengths = tokenizer(
             examples["text"], padding=False,
             truncation=False, return_length=True)["length"]
 
@@ -95,7 +106,7 @@ def save_dataset(dataset: Dataset, data_dir: str, model_name: str):
 
     dataset_name += f"_{model_name}_translated"
 
-    dataset.to_csv(f"data/processed/{dataset_name}")
+    dataset.to_csv(f"data/processed/{dataset_name}/{dataset_name}.csv")
 
 
 if __name__ == "__main__":
