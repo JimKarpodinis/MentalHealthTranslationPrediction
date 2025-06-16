@@ -1,19 +1,26 @@
+import ray
 import argparse
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from accelerate import PartialState
 from accelerate.utils import gather_object
 from datasets import Dataset, load_dataset
+from s3fs import S3FileSystem
 import torch
 
 
+@ray.remote#(num_gpus=4)
 def main(model_name: str, data_dir: str, target_language: str) -> None:
 
     hf_token = os.getenv("HF_TOKEN")
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # quantization_config = BitsAndBytesConfig(load_in_8_bit=True)
 
+    model = AutoModelForCausalLM.from_pretrained(
+            model_name, device_map="cpu", token=hf_token)
+             #quantization_config=quantization_config)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     dataset = load_dataset("csv", data_dir=data_dir, split="train")
 
@@ -21,7 +28,7 @@ def main(model_name: str, data_dir: str, target_language: str) -> None:
         example, target_language))
 
     dataset = dataset.map(lambda batch: translate_sentences(
-        batch, model, tokenizer), batched=True, batch_size=64)
+        batch, model, tokenizer), batched=True, batch_size=4)
 
     save_dataset(dataset, data_dir, model_name)
 
@@ -53,17 +60,28 @@ def translate_sentences(examples: dict,
 
         tokenizer.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
+    if tokenizer.pad_token is None:
+
+        tokenizer.pad_token = tokenizer.eos_token
+
     tokenized_examples = tokenizer.apply_chat_template(
             examples["instruction_prompt"],
             tokenize=True,
-            add_generation_prompt=True, return_tensors="pt",
-            max_length=512, truncation=True, padding=True).to("cuda")
+            add_generation_prompt=True, return_dict=True,
+            return_tensors="pt", max_length=512,
+            truncation=True, padding="max_length").to(model.device)
+
 
     model_outputs = model.generate(
-            tokenized_examples,
-            max_new_tokens=max_batch_sentence_length)
+            **tokenized_examples,
+            max_new_tokens=max_batch_sentence_length,
+            return_dict_in_generate=True)
 
-    translations = [output[0]["generated_text"] for output in model_outputs]
+
+    prompt_length = tokenized_examples.shape[1]
+    breakpoint()
+    translations = tokenizer.batch_decode(model_outputs.sequences[prompt_length:])
+
 
     examples["translated_text"] = translations
 
@@ -103,10 +121,15 @@ def save_dataset(dataset: Dataset, data_dir: str, model_name: str):
 
     dataset_name = os.path.basename(data_dir)
     model_name = model_name.split("/")[-1]
+    fs = S3FileSystem()
+
 
     dataset_name += f"_{model_name}_translated"
 
-    dataset.to_csv(f"data/processed/{dataset_name}/{dataset_name}.csv")
+    #dataset.to_csv(f"data/processed/{dataset_name}/{dataset_name}.csv")
+    dataset.save_to_disk(
+            f"s3://dimitris-bucket/project_name=MentalHealthTranslationPrediction/data/raw",
+            fs=fs)
 
 
 if __name__ == "__main__":
@@ -123,4 +146,5 @@ if __name__ == "__main__":
   args = vars(parser.parse_args())
   # dict of argument
 
-  main(**args)
+  ray.init()
+  ray.get(main.remote(**args))
