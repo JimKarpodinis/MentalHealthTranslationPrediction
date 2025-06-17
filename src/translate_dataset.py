@@ -1,11 +1,12 @@
 import ray
 import argparse
 import os
+import s3fs
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from accelerate import PartialState
 from accelerate.utils import gather_object
 from datasets import Dataset, load_dataset
-from s3fs import S3FileSystem
+import datasets
 import torch
 
 
@@ -68,8 +69,8 @@ def translate_sentences(examples: dict,
             examples["instruction_prompt"],
             tokenize=True,
             add_generation_prompt=True, return_dict=True,
-            return_tensors="pt", max_length=512,
-            truncation=True, padding="max_length").to(model.device)
+            return_tensors="pt", 
+            truncation=False, padding="longest").to(model.device)
 
 
     model_outputs = model.generate(
@@ -78,9 +79,8 @@ def translate_sentences(examples: dict,
             return_dict_in_generate=True)
 
 
-    prompt_length = tokenized_examples.shape[1]
-    breakpoint()
-    translations = tokenizer.batch_decode(model_outputs.sequences[prompt_length:])
+    prompt_length = tokenized_examples["input_ids"].shape[1]
+    translations = tokenizer.batch_decode(model_outputs.sequences[:, prompt_length+1:])
 
 
     examples["translated_text"] = translations
@@ -119,17 +119,20 @@ def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM) 
 
 def save_dataset(dataset: Dataset, data_dir: str, model_name: str): 
 
+    aws_secret_access_key = os.getenv("aws_secret_access_key")
+    aws_access_key_id = os.getenv("aws_access_key_id")
+
     dataset_name = os.path.basename(data_dir)
     model_name = model_name.split("/")[-1]
-    fs = S3FileSystem()
 
+    s3 = s3fs.S3FileSystem(key=aws_access_key_id, secret=aws_secret_access_key)
 
     dataset_name += f"_{model_name}_translated"
+    project_name= "MentalHealthTranslationPrediction"
 
-    #dataset.to_csv(f"data/processed/{dataset_name}/{dataset_name}.csv")
     dataset.save_to_disk(
-            f"s3://dimitris-bucket/project_name=MentalHealthTranslationPrediction/data/raw",
-            fs=fs)
+            f"s3://dimitris-bucket/project_name={project_name}/data/translations/{dataset_name}/",
+            storage_options=s3.storage_options)
 
 
 if __name__ == "__main__":
