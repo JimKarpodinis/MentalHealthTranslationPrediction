@@ -1,5 +1,5 @@
+import json
 import ray
-import argparse
 import os
 import s3fs
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -10,16 +10,18 @@ import datasets
 import torch
 
 
-@ray.remote#(num_gpus=4)
-def main(model_name: str, data_dir: str, target_language: str) -> None:
+@ray.remote(num_gpus=1)
+def main(model_name: str, data_dir: str,
+         target_language: str, temperature: float,
+         batch_size: int) -> None:
 
     hf_token = os.getenv("HF_TOKEN")
 
-    # quantization_config = BitsAndBytesConfig(load_in_8_bit=True)
+    quantization_config = BitsAndBytesConfig(load_in_8_bit=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map="cpu", token=hf_token)
-             #quantization_config=quantization_config)
+            model_name, device_map="auto", token=hf_token,
+             quantization_config=quantization_config)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
@@ -29,9 +31,9 @@ def main(model_name: str, data_dir: str, target_language: str) -> None:
         example, target_language))
 
     dataset = dataset.map(lambda batch: translate_sentences(
-        batch, model, tokenizer), batched=True, batch_size=4)
+        batch, model, tokenizer, temperature), batched=True, batch_size=batch_size)
 
-    save_dataset(dataset, data_dir, model_name)
+    save_dataset(dataset, data_dir, model_name, temperature)
 
 
 def create_instruction_prompt(example: dict, target_language: str) -> dict:
@@ -49,7 +51,7 @@ def create_instruction_prompt(example: dict, target_language: str) -> dict:
 
 
 def translate_sentences(examples: dict,
-        model: AutoModelForCausalLM, tokenizer: AutoTokenizer) -> dict:
+                        model: AutoModelForCausalLM, tokenizer: AutoTokenizer, temperature: float) -> dict:
 
     sentence_lengths = tokenizer(
             examples["text"], padding=False,
@@ -76,7 +78,7 @@ def translate_sentences(examples: dict,
     model_outputs = model.generate(
             **tokenized_examples,
             max_new_tokens=max_batch_sentence_length,
-            return_dict_in_generate=True)
+            return_dict_in_generate=True, temperature=temperature, do_sample=True)
 
 
     prompt_length = tokenized_examples["input_ids"].shape[1]
@@ -117,7 +119,7 @@ def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM) 
     return examples
 
 
-def save_dataset(dataset: Dataset, data_dir: str, model_name: str): 
+def save_dataset(dataset: Dataset, data_dir: str, model_name: str, temperature: float): 
 
     aws_secret_access_key = os.getenv("aws_secret_access_key")
     aws_access_key_id = os.getenv("aws_access_key_id")
@@ -127,7 +129,7 @@ def save_dataset(dataset: Dataset, data_dir: str, model_name: str):
 
     s3 = s3fs.S3FileSystem(key=aws_access_key_id, secret=aws_secret_access_key)
 
-    dataset_name += f"_{model_name}_translated"
+    dataset_name += f"_model_name={model_name}_temperature={temperature}_translated"
     project_name= "MentalHealthTranslationPrediction"
 
     dataset.save_to_disk(
@@ -137,17 +139,11 @@ def save_dataset(dataset: Dataset, data_dir: str, model_name: str):
 
 if __name__ == "__main__":
     
-  parser = argparse.ArgumentParser()
+  with open("json/translate_args.json", "rb") as f:
+      args = json.load(f)
 
-  parser.add_argument("--model_name", help= "The hf model name", type=str)
-  parser.add_argument("--data_dir", help= "The path where the data reside", type=str)
-
-  parser.add_argument("--target_language",
-                      help= "The language to which the text should be translated",
-                      type=str)
-
-  args = vars(parser.parse_args())
   # dict of argument
+  # args = vars(parser.parse_args())
 
   ray.init()
   ray.get(main.remote(**args))
