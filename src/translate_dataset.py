@@ -17,6 +17,9 @@ def main(model_name: str, data_dir: str,
 
     hf_token = os.getenv("HF_TOKEN")
 
+    job_params = locals()
+    log_job_params(job_params)
+
     quantization_config = BitsAndBytesConfig(load_in_8_bit=True)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -34,6 +37,16 @@ def main(model_name: str, data_dir: str,
         batch, model, tokenizer, temperature), batched=True, batch_size=batch_size)
 
     save_dataset(dataset, data_dir, model_name, temperature)
+
+
+def log_job_params(job_params: dict):
+
+    job_pid = os.getpid()
+
+    log_file = os.path.join("tmp/ray/session_latest/logs/job_params_", job_pid)
+
+    with open(log_file, "w") as f:
+        json.dump(job_params, f)
 
 
 def create_instruction_prompt(example: dict, target_language: str) -> dict:
