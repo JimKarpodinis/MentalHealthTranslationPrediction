@@ -1,0 +1,5 @@
+{"model_name": "meta-llama/Llama-3.3-70B-Instruct",
+  "data_dir": "./data/raw/Depression_Reddit_Severity",
+  "target_language": "Greek",
+  "temperature": 0.2,
+  "batch_size": 8}
