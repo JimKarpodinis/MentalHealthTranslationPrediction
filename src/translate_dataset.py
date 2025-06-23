@@ -1,4 +1,6 @@
 import json
+import numpy as np
+import logging
 import ray
 import os
 import s3fs
@@ -10,15 +12,17 @@ import datasets
 import torch
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=2)
 def main(model_name: str, data_dir: str,
          target_language: str, temperature: float,
          batch_size: int) -> None:
 
-    hf_token = os.getenv("HF_TOKEN")
-
     job_params = locals()
     log_job_params(job_params)
+
+    hf_token = os.getenv("HF_TOKEN")
+
+    dataset = load_dataset("csv", data_dir=data_dir, split="train")
 
     quantization_config = BitsAndBytesConfig(load_in_8_bit=True)
 
@@ -41,12 +45,8 @@ def main(model_name: str, data_dir: str,
 
 def log_job_params(job_params: dict):
 
-    job_pid = os.getpid()
-
-    log_file = os.path.join("tmp/ray/session_latest/logs/job_params_", job_pid)
-
-    with open(log_file, "w") as f:
-        json.dump(job_params, f)
+    logger = logging.getLogger("ray")
+    logger.info(f"job Parameters: {job_params}")
 
 
 def create_instruction_prompt(example: dict, target_language: str) -> dict:
@@ -87,45 +87,65 @@ def translate_sentences(examples: dict,
             return_tensors="pt", 
             truncation=False, padding="longest").to(model.device)
 
-
     model_outputs = model.generate(
             **tokenized_examples,
             max_new_tokens=max_batch_sentence_length,
             return_dict_in_generate=True, temperature=temperature, do_sample=True)
 
-
     prompt_length = tokenized_examples["input_ids"].shape[1]
     translations = tokenizer.batch_decode(model_outputs.sequences[:, prompt_length+1:])
-
 
     examples["translated_text"] = translations
 
     return examples
 
 
-def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM) -> dict:
+def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM,
+                                   tokenizer: AutoTokenizer, temperature: float) -> dict:
 
     partial_state = PartialState()
-
     sentence_lengths = tokenizer(
             examples["text"], padding=False,
             truncation=False, return_length=True)["length"]
 
     max_batch_sentence_length = max(sentence_lengths)
 
-    with partial_state.split_between_processes(
-            examples["instruction_prompt"]) as batched_prompts:
+    if tokenizer.chat_template is None:
 
-        model_outputs_ = model(
+        tokenizer.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+
+    if tokenizer.pad_token is None:
+
+        tokenizer.pad_token = tokenizer.eos_token
+
+    with partial_state.split_between_processes(
+            examples["instruction_prompt"],
+            apply_padding=True) as batched_prompts:
+
+        tokenized_examples = tokenizer.apply_chat_template(
                 batched_prompts,
-                max_new_tokens=max_batch_sentence_length)
+                tokenize=True,
+                add_generation_prompt=True, return_dict=True,
+                return_tensors="pt", 
+                truncation=False, padding="longest").to(model.device)
+
+        prompt_length = tokenized_examples["input_ids"].shape[1]
+
+        model_outputs_ = model.generate(
+                **tokenized_examples,
+                max_new_tokens=max_batch_sentence_length,
+                return_dict_in_generate=True,
+                temperature=temperature, do_sample=True)
+
+        model_outputs_ = np.unique(
+                model_outputs_.sequences[:, prompt_length+1:])
 
     partial_state.wait_for_everyone()
     model_outputs = gather_object(model_outputs_)
 
     if partial_state.is_main_process:
 
-        translations = [output[0]["generated_text"] for output in model_outputs]
+        translations = tokenizer.batch_decode(model_outputs)
 
         examples["translated_text"] = translations
 
@@ -134,19 +154,23 @@ def translate_sentences_accelerate(examples: dict, model: AutoModelForCausalLM) 
 
 def save_dataset(dataset: Dataset, data_dir: str, model_name: str, temperature: float): 
 
-    aws_secret_access_key = os.getenv("aws_secret_access_key")
-    aws_access_key_id = os.getenv("aws_access_key_id")
+    aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_session_token = os.getenv("AWS_SESSION_TOKEN")
 
     dataset_name = os.path.basename(data_dir)
     model_name = model_name.split("/")[-1]
 
-    s3 = s3fs.S3FileSystem(key=aws_access_key_id, secret=aws_secret_access_key)
+    s3 = s3fs.S3FileSystem(client_kwargs={
+        "aws_access_key_id":aws_access_key_id,
+        "aws_secret_access_key":aws_secret_access_key,
+        "aws_session_token":aws_session_token})
 
-    dataset_name += f"_model_name={model_name}_temperature={temperature}_translated"
+    # dataset_name += f"_model_name={model_name}_translated"
     project_name= "MentalHealthTranslationPrediction"
 
-    dataset.save_to_disk(
-            f"s3://dimitris-bucket/project_name={project_name}/data/translations/{dataset_name}/",
+    dataset.to_csv(
+            f"s3://dimitris-bucket/project_name={project_name}/data/translations/dataset={dataset_name}/model={model_name}/temperature={temperature}/translation.csv",
             storage_options=s3.storage_options)
 
 
@@ -154,9 +178,10 @@ if __name__ == "__main__":
     
   with open("json/translate_args.json", "rb") as f:
       args = json.load(f)
+      # dict of argument
 
-  # dict of argument
-  # args = vars(parser.parse_args())
+  ray.init(
+          logging_config=ray.LoggingConfig(
+              log_level="INFO"))
 
-  ray.init()
   ray.get(main.remote(**args))
